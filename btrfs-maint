@@ -52,7 +52,7 @@ def get_btrfs_stats(path):
     stats = {}
     p = run('btrfs', 'fi', 'usage', '-b', '-T', path)
     lines = [s.strip() for s in p.stdout.splitlines()]
-    for k, v in [s.partition(':') for s in lines if ':' in s]:
+    for k, _, v in [s.partition(':') for s in lines if ':' in s]:
         if v:
             stats[k] = float(v.split()[0])
     tab = lines[-2].split()

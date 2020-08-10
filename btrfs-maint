@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+import argparse
+import logging
+import shlex
+import subprocess
+from datetime import datetime
+from logging.handlers import WatchedFileHandler
+from pprint import pformat
+from textwrap import indent
+from time import sleep
+
+log = logging.getLogger(__name__)
+
+
+def run(*cmd):
+    log.debug('Running: %s', ' '.join(shlex.quote(arg) for arg in cmd))
+    p = subprocess.run(cmd, capture_output=True, universal_newlines=True)
+    log.debug('Stdout:\n%s', indent(p.stdout, '  '))
+    if p.stderr:
+        log.warning('Stderr:\n%s', indent(p.stdout, '  '))
+    return p
+
+
+def get_btrfs_paths():
+    log.info('Probing for btrfs mounts')
+    p = run('findmnt', '-t', 'btrfs', '-nlC', '-o', 'TARGET,UUID')
+    uuids = set()
+    paths = set()
+    for line in p.stdout.splitlines():
+        path, uuid = line.split()
+        if uuid not in uuids:
+            paths.add(path)
+            uuids.add(uuid)
+    return paths
+
+
+def get_btrfs_health(path):
+    log.info('Checking device health for: %s', path)
+    errors = []
+    p = run('btrfs', 'dev', 'stats', '-c', path)
+    if p.returncode != 0:
+        errors.append(p.stdout)
+    p = run('btrfs', 'fi', 'show', path)
+    if 'missing' in p.stdout:
+        errors.append(p.stdout)
+    return errors
+
+
+def get_btrfs_stats(path):
+    log.info('Querying usage on: %s', path)
+    stats = {}
+    p = run('btrfs', 'fi', 'usage', '-b', '-T', path)
+    lines = [s.strip() for s in p.stdout.splitlines()]
+    for k, v in [s.partition(':') for s in lines if ':' in s]:
+        if v:
+            stats[k] = float(v.split()[0])
+    tab = lines[-2].split()
+    stats['Total Data'] = float(tab[1])
+    stats['Total Metadata'] = float(tab[2])
+    stats['Total System'] = float(tab[3])
+    tab = lines[-1].split()
+    stats['Used Data'] = float(tab[1])
+    stats['Used Metadata'] = float(tab[2])
+    stats['Used System'] = float(tab[3])
+    log.debug('Parsed:\n%s', indent(pformat(stats), '  '))
+    return stats
+
+
+def is_balance_required(stats):
+    unused_allocations = stats['Device allocated'] - stats['Used']
+    unused_percentage = (unused_allocations / stats['Device size']) * 100
+    log.debug('Checking balance. Unused: %s%% (%d) Max: %d%%',
+              round(unused_percentage, 2), unused_allocations, args.balance)
+    return unused_percentage > args.balance
+
+
+def is_device_full(stats):
+    unused_space = stats['Device size'] - stats['Used']
+    free_percentage = (unused_space / stats['Device size']) * 100
+    log.debug('Checking full. Free: %f%% (%d), Min: %d%%',
+              round(free_percentage, 2), unused_space, args.balance)
+    return free_percentage >= args.balance
+
+
+def run_balance(path):
+    log.info('Starting balance on: {}'.format(path))
+    for i in range(0, 101, 5):
+        p = run('ionice', '-c3', 'btrfs', 'balance', 'start', '-dusage={}'.format(i), path)
+        if p.stderr and 'No space left on device' in p.stderr:
+            log.error('No space left on %s. You must manually delete files to continue.', path)
+            break
+        stats = get_btrfs_stats(path)
+        # If we have used more than our optimal allocation,
+        # never run more than a 5% balance. This should
+        # prevent us from thrashing full filesystems.
+        if i >= 5 and is_device_full(stats):
+            log.warning('Free space on %s is suboptimal, limited balanced to 5%%.', path)
+            break
+        if not is_balance_required(stats):
+            log.info('Restored %s to optimal state with a %s%% balance.', path, i)
+            break
+
+
+def get_scrub_status(path):
+    log.info('Querying scrub status on: %s', path)
+    p = run('btrfs', 'scrub', 'status', path)
+    status = {k.strip(): v.strip() for k, _, v in [s.partition(':') for s in p.stdout.splitlines()]}
+    started = status.get('Scrub started')
+    if started:
+        status['Scrub started'] = datetime.strptime(status['Scrub started'], "%c")
+    else:
+        status['Scrub started'] = datetime.fromtimestamp(0)
+    log.debug('Parsed:\n%s', indent(pformat(status), '  '))
+    return status
+
+
+def run_scrub(path):
+    log.info('Running scrub on: %s', path)
+    p = run('btrfs', 'scrub', 'start', path)
+    if p.returncode == 0:
+        while True:
+            status = get_scrub_status(path)
+            if status.get('Status') == 'running':
+                sleep(60)
+            else:
+                break
+        if status['Error summary'] != 'no errors found':
+            log.error(status['Error summary'])
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('path', nargs='*',
+                        help='Run maintenance one or more paths. Default will balance all paths.')
+    parser.add_argument('-b', '--balance', type=int, default=5,
+                        help='Balance paths until the percent of unused allocations is less than value.')
+    parser.add_argument('-s', '--scrub', type=int, default=7,
+                        help='Number of days between each filesystem scrub')
+    parser.add_argument('-l', '--logfile', help='Log to filename')
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                        help='Print verboose logs to stdout.')
+    args = parser.parse_args()
+
+    h = logging.StreamHandler()
+    # Default to warning and ratchet up to DEBUG for each additional -v
+    h.setLevel(max(logging.WARNING - 10 * args.verbose, logging.DEBUG))
+    h.setFormatter(logging.Formatter('%(message)s'))
+    log.addHandler(h)
+
+    if args.logfile:
+        h = WatchedFileHandler(args.logfile)
+        h.setLevel(logging.INFO)
+        log.addHandler(h)
+
+    log.setLevel(logging.DEBUG)
+
+    paths = get_btrfs_paths()
+    if args.path:
+        paths = paths.intersection(args.path)
+    log.debug('Detected btrfs mounts at:\n%s', indent('\n'.join(paths), '  '))
+
+    if not paths:
+        log.warning('No btrfs paths detected.')
+
+    for path in paths:
+        errors = get_btrfs_health(path)
+        if errors:
+            log.critical('Detected errors on %s\n%s', path, indent('\n'.join(errors), '  '))
+            continue
+
+        scrub_status = get_scrub_status(path)
+        last = datetime.now() - scrub_status['Scrub started']
+        if last.days >= args.scrub:
+            run_scrub(path)
+
+        if is_balance_required(get_btrfs_stats(path)):
+            run_balance(path)
